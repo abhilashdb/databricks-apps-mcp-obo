@@ -1,0 +1,35 @@
+# Databricks App configuration for MCP OBO Demo
+#
+# KEY CONFIGURATION: user_api_scopes
+# ---------------------------------
+# This is the critical setting that enables On-Behalf-Of (OBO) authentication.
+# When a user visits this app, Databricks will:
+#   1. Authenticate the user via SSO
+#   2. Mint a scoped OAuth token for the user
+#   3. Inject it as the `x-forwarded-access-token` HTTP header
+#
+# The token is scoped to ONLY the APIs listed here.
+# For MCP Services (system.ai.*), we need the `ai-gateway` scope
+# because MCP Services are invoked through Unity Gateway.
+#
+# Without this section, the app only gets service principal credentials
+# (app authorization), NOT the user's identity.
+
+command:
+  - streamlit
+  - run
+  - app.py
+
+# Enable user authorization (OBO) with specific scopes
+user_api_scopes:
+  - ai-gateway  # Required for calling MCP Services via Unity Gateway
+
+# NOTE: If you also need to query SQL warehouses on behalf of the user,
+# add the 'sql' scope. For accessing UC tables/functions directly, add
+# 'catalog.tables'. Each scope widens what the forwarded token can do.
+#
+# Example with multiple scopes:
+# user_api_scopes:
+#   - ai-gateway
+#   - sql
+#   - catalog.tables

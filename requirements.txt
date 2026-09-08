@@ -1,0 +1,6 @@
+streamlit
+databricks-sdk>=0.40.0
+databricks-mcp
+fastapi
+uvicorn
+httpx
