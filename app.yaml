@@ -16,13 +16,15 @@
 # (app authorization), NOT the user's identity.
 
 command:
-  - streamlit
-  - run
-  - app.py
+  - uvicorn
+  - api_app:app
+  - --host
+  - "0.0.0.0"
 
 # Enable user authorization (OBO) with specific scopes
 user_api_scopes:
-  - ai-gateway  # Required for calling MCP Services via Unity Gateway
+  - ai-gateway            # Required for MCP Services via Unity Gateway
+  - catalog.connections   # Required for MCP via UC HTTP connections (/ai-gateway/connections/)
 
 # NOTE: If you also need to query SQL warehouses on behalf of the user,
 # add the 'sql' scope. For accessing UC tables/functions directly, add

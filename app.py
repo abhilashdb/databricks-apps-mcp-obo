@@ -52,9 +52,17 @@ _raw_host = os.environ["DATABRICKS_HOST"].rstrip("/")
 WORKSPACE_HOST = _raw_host if _raw_host.startswith("https://") else f"https://{_raw_host}"
 
 # MCP Service URLs (built-in services via Unity Gateway)
+# These use the /ai-gateway/mcp-services/ path -> scope: ai-gateway
 MCP_SERVICES = {
     "Google Calendar": f"{WORKSPACE_HOST}/ai-gateway/mcp-services/system.ai.google_calendar",
     "Gmail": f"{WORKSPACE_HOST}/ai-gateway/mcp-services/system.ai.gmail",
+    "Web Search (custom)": f"{WORKSPACE_HOST}/ai-gateway/mcp-services/<your_catalog>.<your_schema>.<your_mcp_service>",
+}
+
+# MCP via UC HTTP Connections (uses /ai-gateway/connections/ path)
+# These route through the UC connections proxy — requires USE_CONNECTION grant
+MCP_CONNECTIONS = {
+    "Slack (via connection)": f"{WORKSPACE_HOST}/ai-gateway/connections/<your_connection_name>",
 }
 
 # ---------------------------------------------------------------------------
@@ -313,10 +321,25 @@ if not MCP_CLIENT_AVAILABLE:
     )
     st.stop()
 
-selected_service = st.selectbox("MCP Service", list(MCP_SERVICES.keys()))
-service_url = MCP_SERVICES[selected_service]
+# Combine both MCP Services and UC Connections into one selector
+all_mcp_endpoints = {}
+for name, url in MCP_SERVICES.items():
+    all_mcp_endpoints[f"MCP Service: {name}"] = (url, "mcp-service")
+for name, url in MCP_CONNECTIONS.items():
+    all_mcp_endpoints[f"UC Connection: {name}"] = (url, "connection")
+
+selected_label = st.selectbox("MCP Endpoint", list(all_mcp_endpoints.keys()))
+service_url, endpoint_type = all_mcp_endpoints[selected_label]
+
+if endpoint_type == "connection":
+    st.info(
+        "**UC Connection path** (`/ai-gateway/connections/...`): "
+        "Routes through the UC HTTP connections proxy. "
+        "May require additional OAuth scopes beyond `ai-gateway`."
+    )
 
 st.code(
+    f'# Endpoint type: {endpoint_type}\n'
     f'mcp_client = DatabricksMCPClient(\n'
     f'    server_url="{service_url}",\n'
     f'    workspace_client=ws,  # user-scoped OBO client\n'
@@ -325,7 +348,45 @@ st.code(
 )
 
 # --- Discover tools ---
-if st.button("\U0001f50d List Available Tools"):
+col_discover, col_raw = st.columns(2)
+
+with col_discover:
+    discover_btn = st.button("List Available Tools")
+with col_raw:
+    raw_test_btn = st.button("Raw HTTP Test (show full error)")
+
+if raw_test_btn:
+    # Send a raw JSON-RPC initialize request using the OBO token
+    # This bypasses the MCP client and shows the exact server response
+    import requests as _req
+    user_token = st.context.headers.get("x-forwarded-access-token")
+    raw_headers = {
+        "Authorization": f"Bearer {user_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    init_payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "obo-test", "version": "1.0"}
+        }
+    }
+    with st.spinner("Sending raw JSON-RPC initialize..."):
+        try:
+            resp = _req.post(service_url, json=init_payload, headers=raw_headers, timeout=15)
+            st.markdown(f"**HTTP Status:** `{resp.status_code}`")
+            st.markdown(f"**Content-Type:** `{resp.headers.get('content-type', 'N/A')}`")
+            try:
+                st.json(resp.json())
+            except Exception:
+                st.code(resp.text[:2000])
+        except Exception as e:
+            st.error(f"Request failed: {e}")
+
+if discover_btn:
     try:
         with st.spinner("Discovering tools via MCP tools/list..."):
             tools = list_mcp_tools(ws, service_url)
@@ -338,8 +399,7 @@ if st.button("\U0001f50d List Available Tools"):
                 "**OAuth consent required.** You haven't authorized this "
                 "service yet.\n\n"
                 "**To fix:** Open the MCP Service in Catalog Explorer "
-                "(`system.ai.google_calendar` or `system.ai.gmail`) and "
-                "click **Login** to complete the one-time OAuth flow.\n\n"
+                "and click **Login** to complete the one-time OAuth flow.\n\n"
                 f"Error detail: `{error_msg}`"
             )
         else:
@@ -356,57 +416,43 @@ if "tools" in st.session_state:
 # --- Step 3: Call a tool ---
 st.header("Step 3: Call an MCP Tool")
 
-if selected_service == "Google Calendar":
-    st.markdown("**Example: List upcoming calendar events**")
+# Build tool name list from discovered tools, or let user type
+tool_names = [t.name for t in st.session_state.get("tools", [])]
+tool_name = st.selectbox(
+    "Tool name",
+    tool_names if tool_names else ["(discover tools first)"],
+)
 
+# Show default args based on known tools
+default_args = "{}"
+if tool_name == "calendar_event_list":
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
-    time_min = now.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-    time_max = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    t_min = now.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    t_max = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    default_args = json.dumps({"time_min": t_min, "time_max": t_max}, indent=2)
+elif tool_name == "gmail_search":
+    default_args = json.dumps({"query": "is:unread", "maxResults": 5}, indent=2)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        t_min = st.text_input("time_min (RFC3339)", value=time_min)
-    with col_b:
-        t_max = st.text_input("time_max (RFC3339)", value=time_max)
+tool_args_str = st.text_area("Tool arguments (JSON)", value=default_args, height=100)
 
-    if st.button("\U0001f4c5 List Calendar Events"):
-        try:
-            with st.spinner("Calling calendar_event_list via MCP..."):
-                result = call_mcp_tool(
-                    ws, service_url,
-                    tool_name="calendar_event_list",
-                    tool_args={
-                        "time_min": t_min,
-                        "time_max": t_max,
-                    },
-                )
-            st.json(result)
-        except Exception as e:
-            is_consent, msg = format_mcp_error(e)
-            if is_consent:
-                st.error(f"**OAuth consent required.** Authorize in Catalog Explorer first.\n\nDetail: `{msg}`")
-            else:
-                st.error(f"Tool call failed: {msg}")
+if st.button("Call Tool"):
+    try:
+        tool_args = json.loads(tool_args_str)
+    except json.JSONDecodeError as e:
+        st.error(f"Invalid JSON: {e}")
+        st.stop()
 
-elif selected_service == "Gmail":
-    st.markdown("**Example: Search recent emails**")
-    query = st.text_input("Search query", value="is:unread")
-    if st.button("\U0001f4e7 Search Gmail"):
-        try:
-            with st.spinner("Calling gmail_search via MCP..."):
-                result = call_mcp_tool(
-                    ws, service_url,
-                    tool_name="gmail_search",
-                    tool_args={"query": query, "maxResults": 5},
-                )
-            st.json(result)
-        except Exception as e:
-            is_consent, msg = format_mcp_error(e)
-            if is_consent:
-                st.error(f"**OAuth consent required.** Authorize in Catalog Explorer first.\n\nDetail: `{msg}`")
-            else:
-                st.error(f"Tool call failed: {msg}")
+    try:
+        with st.spinner(f"Calling {tool_name} via MCP..."):
+            result = call_mcp_tool(ws, service_url, tool_name=tool_name, tool_args=tool_args)
+        st.json(result)
+    except Exception as e:
+        is_consent, msg = format_mcp_error(e)
+        if is_consent:
+            st.error(f"**OAuth consent required.** Authorize in Catalog Explorer first.\n\nDetail: `{msg}`")
+        else:
+            st.error(f"Tool call failed: {msg}")
 
 # --- Auth explanation footer ---
 st.divider()

@@ -245,6 +245,121 @@ def _unwrap_exception_obj(e: Exception) -> Exception:
     return e
 
 
+def _resolve_mcp_url(mcp_uri: str) -> str:
+    """Resolve an MCP URI to a full URL.
+
+    Accepts:
+      - Full URL: https://host/ai-gateway/mcp-services/catalog.schema.service
+      - Fully qualified name: catalog.schema.service
+      - Connection name prefixed with 'connection:': connection:my_conn
+    """
+    if mcp_uri.startswith("https://") or mcp_uri.startswith("http://"):
+        return mcp_uri
+    if mcp_uri.startswith("connection:"):
+        conn_name = mcp_uri[len("connection:"):]
+        return f"{WORKSPACE_HOST}/ai-gateway/connections/{conn_name}"
+    # Assume fully qualified MCP service name (catalog.schema.service)
+    return f"{WORKSPACE_HOST}/ai-gateway/mcp-services/{mcp_uri}"
+
+
+# ---------------------------------------------------------------------------
+# Custom MCP URI endpoints — call ANY MCP service by URI
+# ---------------------------------------------------------------------------
+
+@app.post("/api/mcp/custom/tools")
+async def custom_list_tools(request: Request):
+    """List tools for any MCP service by URI.
+
+    Request body:
+    {
+        "mcp_uri": "catalog.schema.service_name"
+    }
+
+    mcp_uri formats:
+      - Fully qualified name: "<your_catalog>.<your_schema>.<your_mcp_service>"
+      - Full URL: "https://<host>/ai-gateway/mcp-services/catalog.schema.service"
+      - UC connection: "connection:my_slack_conn"
+    """
+    body = await request.json()
+    mcp_uri = body.get("mcp_uri")
+    if not mcp_uri:
+        raise HTTPException(400, "mcp_uri is required")
+
+    service_url = _resolve_mcp_url(mcp_uri)
+    ws = get_user_ws_from_request(request)
+    client = DatabricksMCPClient(server_url=service_url, workspace_client=ws)
+
+    try:
+        tools = await asyncio.to_thread(client.list_tools)
+        return {
+            "mcp_uri": mcp_uri,
+            "resolved_url": service_url,
+            "tools": [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.inputSchema if hasattr(t, 'inputSchema') else None,
+                }
+                for t in tools
+            ],
+        }
+    except Exception as e:
+        inner = _unwrap_exception_obj(e)
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to list tools for {mcp_uri}: {inner}")
+
+
+@app.post("/api/mcp/custom/call")
+async def custom_call_tool(request: Request):
+    """Call a tool on any MCP service by URI.
+
+    Request body:
+    {
+        "mcp_uri": "catalog.schema.service_name",
+        "tool_name": "tool_to_call",
+        "tool_args": {}
+    }
+    """
+    body = await request.json()
+    mcp_uri = body.get("mcp_uri")
+    tool_name = body.get("tool_name")
+    tool_args = body.get("tool_args", {})
+
+    if not mcp_uri:
+        raise HTTPException(400, "mcp_uri is required")
+    if not tool_name:
+        raise HTTPException(400, "tool_name is required")
+
+    service_url = _resolve_mcp_url(mcp_uri)
+    ws = get_user_ws_from_request(request)
+    client = DatabricksMCPClient(server_url=service_url, workspace_client=ws)
+
+    try:
+        result = await asyncio.to_thread(client.call_tool, tool_name, tool_args)
+        if result.content:
+            try:
+                parsed = json.loads(result.content[0].text)
+                return {"mcp_uri": mcp_uri, "tool_name": tool_name, "result": parsed}
+            except (json.JSONDecodeError, AttributeError, IndexError):
+                return {"mcp_uri": mcp_uri, "tool_name": tool_name, "result": [c.text for c in result.content]}
+        return {"mcp_uri": mcp_uri, "tool_name": tool_name, "result": str(result)}
+    except Exception as e:
+        inner = _unwrap_exception_obj(e)
+        error_msg = str(inner)
+        detail_parts = [error_msg]
+        for attr in ('data', 'code', 'message', 'args', '__cause__'):
+            val = getattr(inner, attr, None)
+            if val and str(val) != error_msg:
+                detail_parts.append(f"{attr}={val}")
+        full_detail = " | ".join(detail_parts)
+        import traceback
+        traceback.print_exc()
+        if "-32042" in full_detail or "login" in full_detail.lower():
+            raise HTTPException(403, f"OAuth consent required: {full_detail}")
+        raise HTTPException(500, f"MCP call failed: {full_detail}")
+
+
 # ---------------------------------------------------------------------------
 # Root: Simple HTML page explaining the API
 # ---------------------------------------------------------------------------

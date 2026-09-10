@@ -277,4 +277,3 @@ result = mcp.call_tool("calendar_event_list", {
 - [Use MCP servers in Custom Agents](https://docs.databricks.com/aws/en/agents/mcp-tools/use-mcp-in-agents)
 - [Connect to an API Databricks app using token authentication](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/connect-local)
 - [Databricks-provided MCP Services](https://docs.databricks.com/aws/en/agents/mcp-tools/built-in-mcp-services)
-
